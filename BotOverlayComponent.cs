@@ -4,15 +4,12 @@ using System.Reflection;
 using Comfort.Common;
 using EFT;
 using UnityEngine;
-using UnityEngine.Rendering;
-
 namespace BotOverlay
 {
     /// <summary>
     /// Рисует оверлей с состоянием ботов, путями (3D GL-линии в мире), историей задач.
     /// F9  — показать/скрыть оверлей
     /// F8  — показать/скрыть мёртвых ботов
-    /// F7  — показать/скрыть пути ботов (3D линии в мире)
     /// [/] — перебор ботов (телепорт камеры)
     /// 9/0 — перебор целей заданий (телепорт камеры)
     /// </summary>
@@ -30,7 +27,6 @@ namespace BotOverlay
 
         private bool  _visible      = true;
         private bool  _showDead     = false;
-        private bool  _showPaths    = true;   // F7
         private float _nextUpdate   = 0f;
 
         private readonly List<BotEntry> _entries  = new List<BotEntry>();
@@ -49,9 +45,6 @@ namespace BotOverlay
         private GUIStyle _boxStyle, _titleStyle, _rowStyle;
         private bool     _stylesReady;
 
-        // GL для рисования путей
-        private Material _glMaterial;
-
         // Цвета по типу решения
         private static readonly (string key, Color col)[] _decisionPalette =
         {
@@ -68,15 +61,6 @@ namespace BotOverlay
             ("lay",      new Color(0.6f, 0.9f, 1f)),
         };
 
-        // Цвета путей по типу задания
-        private static readonly Dictionary<string, Color> _taskPathColors =
-            new Dictionary<string, Color>
-            {
-                { "SpawnRush",    new Color(1f,   0.25f, 0.25f, 0.9f) },
-                { "HuntBoss",     new Color(0.9f, 0.35f, 1f,   0.9f) },
-                { "CheckPMCSpawn",new Color(0.2f, 0.8f,  1f,   0.9f) },
-            };
-
         // ─── Рефлексивный доступ к ScavTaskLayer ──────────
         private static bool        _scavReflectionInit     = false;
         private static object      _scavLayersByBotIdDict  = null;
@@ -84,7 +68,6 @@ namespace BotOverlay
         private static PropertyInfo _scavCurrentTaskProp   = null;
         private static PropertyInfo _scavIsInCooldownProp  = null;
         private static PropertyInfo _scavCachedTargetProp  = null;
-        private static FieldInfo   _scavBotPathsField      = null;
         private static FieldInfo   _scavHistoryField       = null;
 
         private static void EnsureScavReflection()
@@ -111,8 +94,6 @@ namespace BotOverlay
                 _scavCachedTargetProp = _scavLayerType.GetProperty("CachedTarget",
                     BindingFlags.Public | BindingFlags.Instance);
 
-                _scavBotPathsField = _scavLayerType.GetField("BotPaths",
-                    BindingFlags.Public | BindingFlags.Static);
                 _scavHistoryField  = _scavLayerType.GetField("TaskHistoryLines",
                     BindingFlags.Public | BindingFlags.Static);
             }
@@ -154,34 +135,12 @@ namespace BotOverlay
             }
         }
 
-        // ─── Lifecycle ────────────────────────────────────
-
-        private void OnEnable()
-        {
-            Camera.onPostRender += OnCameraPostRender;
-        }
-
-        private void OnDisable()
-        {
-            Camera.onPostRender -= OnCameraPostRender;
-        }
-
-        // Вызывается после каждого рендера камеры — рисуем пути в 3D мире
-        private void OnCameraPostRender(Camera cam)
-        {
-            if (!_showPaths) return;
-            // Рисуем только для главной камеры (или свободной камеры freecam)
-            if (cam != Camera.main) return;
-            DrawWorldPaths(cam);
-        }
-
         // ─── Методы вызываемые из плагина ────────────────
 
         public void DoUpdate()
         {
-            if (Input.GetKeyDown(KeyCode.F9)) _visible   = !_visible;
-            if (Input.GetKeyDown(KeyCode.F8)) _showDead  = !_showDead;
-            if (Input.GetKeyDown(KeyCode.F7)) _showPaths = !_showPaths;
+            if (Input.GetKeyDown(KeyCode.F9)) _visible  = !_visible;
+            if (Input.GetKeyDown(KeyCode.F8)) _showDead = !_showDead;
 
             // Клавиатурная навигация
             if (Input.GetKeyDown(KeyCode.LeftBracket))  CycleBot(-1);
@@ -420,18 +379,6 @@ namespace BotOverlay
             catch { return Vector3.zero; }
         }
 
-        private string GetBotTaskNameById(int botId)
-        {
-            try
-            {
-                if (_scavLayersByBotIdDict == null || _scavCurrentTaskProp == null) return string.Empty;
-                var dict  = (System.Collections.IDictionary)_scavLayersByBotIdDict;
-                var layer = dict[(object)botId];
-                return layer == null ? string.Empty : (_scavCurrentTaskProp.GetValue(layer)?.ToString() ?? string.Empty);
-            }
-            catch { return string.Empty; }
-        }
-
         // ─── Рисование основного оверлея ─────────────────
 
         private void DrawOverlay()
@@ -605,90 +552,6 @@ namespace BotOverlay
                 GUI.color = Color.white;
                 y += ROW_H + 2f;
             }
-        }
-
-        // ─── 3D пути ботов (рисуются в Camera.onPostRender) ──
-
-        private void DrawWorldPaths(Camera cam)
-        {
-            EnsureScavReflection();
-            if (_scavBotPathsField == null) return;
-
-            var allPathsObj = _scavBotPathsField.GetValue(null);
-            if (allPathsObj == null) return;
-            var allPaths = allPathsObj as System.Collections.IDictionary;
-            if (allPaths == null || allPaths.Count == 0) return;
-
-            var mat = GetGLMaterial();
-            if (mat == null) return;
-
-            mat.SetPass(0);
-            GL.PushMatrix();
-
-            // Projection + View раздельно — GL.Vertex() принимает мировые координаты
-            GL.LoadProjectionMatrix(cam.projectionMatrix);
-            GL.modelview = cam.worldToCameraMatrix;
-
-            GL.Begin(GL.LINES);
-
-            foreach (System.Collections.DictionaryEntry kv in allPaths)
-            {
-                int botId = (int)kv.Key;
-                var path  = kv.Value as List<Vector3>;
-                if (path == null || path.Count < 2) continue;
-
-                string taskName = GetBotTaskNameById(botId);
-                Color  col      = _taskPathColors.TryGetValue(taskName, out var tc)
-                    ? tc : new Color(0.4f, 1f, 0.4f, 0.9f);
-
-                // Сегменты пути: яркость нарастает к концу (начало = бледнее)
-                for (int i = 1; i < path.Count; i++)
-                {
-                    float t     = (float)i / path.Count;
-                    float alpha = col.a * (0.2f + 0.8f * t);
-                    GL.Color(new Color(col.r, col.g, col.b, alpha));
-
-                    // +0.15м над землёй чтобы не тонуло в текстуре
-                    var p0 = path[i - 1] + Vector3.up * 0.15f;
-                    var p1 = path[i]     + Vector3.up * 0.15f;
-                    GL.Vertex(p0);
-                    GL.Vertex(p1);
-                }
-
-                // 3D крест на последней точке (позиция бота)
-                if (path.Count > 0)
-                {
-                    GL.Color(new Color(col.r, col.g, col.b, 1f));
-                    var end = path[path.Count - 1] + Vector3.up * 0.3f;
-                    const float S = 0.6f;  // размер метки в метрах
-                    GL.Vertex(end + Vector3.left    * S); GL.Vertex(end + Vector3.right   * S);
-                    GL.Vertex(end + Vector3.forward * S); GL.Vertex(end + Vector3.back    * S);
-                    GL.Vertex(end);                       GL.Vertex(end + Vector3.up      * S * 2f);
-                }
-            }
-
-            GL.End();
-            GL.PopMatrix();
-        }
-
-        private Material GetGLMaterial()
-        {
-            if (_glMaterial != null) return _glMaterial;
-            try
-            {
-                var shader = Shader.Find("Hidden/Internal-Colored")
-                          ?? Shader.Find("Sprites/Default");
-                if (shader == null) return null;
-                _glMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
-                _glMaterial.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
-                _glMaterial.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
-                _glMaterial.SetInt("_Cull",     (int)CullMode.Off);
-                _glMaterial.SetInt("_ZWrite",   0);
-                // ZTest = Always (8): линии видны сквозь стены и terrain
-                _glMaterial.SetInt("_ZTest",    (int)CompareFunction.Always);
-            }
-            catch { }
-            return _glMaterial;
         }
 
         // ─── Вспомогательные методы рисования ─────────────

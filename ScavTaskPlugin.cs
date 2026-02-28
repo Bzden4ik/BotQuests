@@ -83,6 +83,16 @@ namespace ScavTaskMod
                 new List<WildSpawnType> { WildSpawnType.followerBully }
             );
             Log.LogInfo("[ScavTaskMod] ReshalaGuardLayer registered (priority 35)");
+
+            // PMC-боты (BEAR и USEC) — квесты EFT + охота на боссов
+            // Приоритет 38: выше StandBy и Reshala (35), ниже боевых слоёв EFT (55+)
+            BrainManager.AddCustomLayer(
+                typeof(PmcTaskLayer),
+                new List<string> { "PmcBear", "PmcUsec" },
+                38,
+                new List<WildSpawnType> { WildSpawnType.pmcBEAR, WildSpawnType.pmcUSEC }
+            );
+            Log.LogInfo("[ScavTaskMod] PmcTaskLayer registered for PmcBear/PmcUsec (priority 38)");
         }
 
         private void Start()
@@ -97,6 +107,7 @@ namespace ScavTaskMod
             ScavTaskLayer.PlayerSpawnKnown = false;
             ScavTaskLayer.NoBossOnMap      = false;
             ReshalaShared.Reset();
+            PmcTaskLayer.Reset();
 
             // Ждём пока загрузится GameWorld с игроком
             while (true)

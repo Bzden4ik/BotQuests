@@ -32,6 +32,7 @@
     <Compile Remove="ScavTask*.cs" />
     <Compile Remove="EftQuestTask.cs" />
     <Compile Remove="Reshala*.cs" />
+    <Compile Remove="PmcTask*.cs" />
     <Compile Remove="ExamplePatches\**" />
   </ItemGroup>
 

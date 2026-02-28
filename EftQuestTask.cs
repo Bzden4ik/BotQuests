@@ -18,7 +18,8 @@ namespace ScavTaskMod
         public string   QuestName;
         public string   ZoneId;
         public Vector3  ZonePosition;
-        public int      AssignedBotId = -1;
+        public int      AssignedBotId    = -1;  // слот для Scav-бота
+        public int      AssignedPmcBotId = -1;  // слот для PMC-бота (независимый)
     }
 
     public class EftKillTask
@@ -26,7 +27,8 @@ namespace ScavTaskMod
         public string             QuestName;
         public EftKillTargetType  TargetType;
         public string             BossRole;   // не null только для Boss
-        public int                AssignedBotId = -1;
+        public int                AssignedBotId    = -1;
+        public int                AssignedPmcBotId = -1;
     }
 
     public class EftFindTask
@@ -35,7 +37,8 @@ namespace ScavTaskMod
         public string[]       TemplateIds;
         public bool           IsCategory;
         public List<Vector3>  LootPositions = new List<Vector3>();
-        public int            AssignedBotId = -1;
+        public int            AssignedBotId    = -1;
+        public int            AssignedPmcBotId = -1;
     }
 
     // ── Менеджер задач ────────────────────────────────────────────────
@@ -407,7 +410,7 @@ namespace ScavTaskMod
             return true;
         }
 
-        // Освобождение задач когда бот завершил или умер
+        // Освобождение задач когда Scav-бот завершил или умер
         public static void ReleaseTasksForBot(int botId)
         {
             foreach (var t in VisitTasks) if (t.AssignedBotId == botId) t.AssignedBotId = -1;
@@ -415,9 +418,68 @@ namespace ScavTaskMod
             foreach (var t in FindTasks)  if (t.AssignedBotId == botId) t.AssignedBotId = -1;
         }
 
-        // Сколько ботов сейчас назначено на каждый тип задания
+        // Сколько Scav-ботов назначено на каждый тип задания
         public static int GetVisitAssignedCount() => VisitTasks.Count(t => t.AssignedBotId != -1);
         public static int GetKillAssignedCount()  => KillTasks.Count(t => t.AssignedBotId != -1);
         public static int GetFindAssignedCount()  => FindTasks.Count(t => t.AssignedBotId != -1);
+
+        // ── PMC-боты: независимые слоты (не конкурируют со Scav-ботами) ──
+
+        public static bool TryGetVisitTaskForPmc(Vector3 botPos, int botId, out EftVisitTask task)
+        {
+            task = null;
+            EftVisitTask best = null;
+            float bestDist = float.MaxValue;
+            foreach (var t in VisitTasks)
+            {
+                if (t.AssignedPmcBotId != -1 && t.AssignedPmcBotId != botId) continue;
+                if (BlockedVisitZoneIds.Contains(t.ZoneId)) continue;
+                float d = Vector3.Distance(botPos, t.ZonePosition);
+                if (d < bestDist) { bestDist = d; best = t; }
+            }
+            if (best == null) return false;
+            best.AssignedPmcBotId = botId;
+            task = best;
+            return true;
+        }
+
+        public static bool TryGetKillTaskForPmc(int botId, out EftKillTask task)
+        {
+            task = null;
+            foreach (var t in KillTasks)
+            {
+                if (t.AssignedPmcBotId != -1 && t.AssignedPmcBotId != botId) continue;
+                t.AssignedPmcBotId = botId;
+                task = t;
+                return true;
+            }
+            return false;
+        }
+
+        public static bool TryGetFindTaskForPmc(Vector3 botPos, int botId, out EftFindTask task)
+        {
+            task = null;
+            EftFindTask best = null;
+            float bestDist = float.MaxValue;
+            foreach (var t in FindTasks)
+            {
+                if (t.AssignedPmcBotId != -1 && t.AssignedPmcBotId != botId) continue;
+                if (t.LootPositions.Count == 0) continue;
+                float d = t.LootPositions.Min(p => Vector3.Distance(botPos, p));
+                if (d < bestDist) { bestDist = d; best = t; }
+            }
+            if (best == null) return false;
+            best.AssignedPmcBotId = botId;
+            task = best;
+            return true;
+        }
+
+        // Освобождение слотов PMC-бота
+        public static void ReleasePmcTasksForBot(int botId)
+        {
+            foreach (var t in VisitTasks) if (t.AssignedPmcBotId == botId) t.AssignedPmcBotId = -1;
+            foreach (var t in KillTasks)  if (t.AssignedPmcBotId == botId) t.AssignedPmcBotId = -1;
+            foreach (var t in FindTasks)  if (t.AssignedPmcBotId == botId) t.AssignedPmcBotId = -1;
+        }
     }
 }

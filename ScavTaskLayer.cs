@@ -74,12 +74,10 @@ namespace ScavTaskMod
         private const  float             MINE_DANGER_SQR = 16f;  // 4 м radius
         private const  float             MAX_PATH_LENGTH = 1500f; // макс длина маршрута в метрах
 
-        // ── Путь бота и история задач (для оверлея) ───────────────────
-        // Bot id → список записанных позиций
-        public static readonly Dictionary<int, List<Vector3>> BotPaths =
-            new Dictionary<int, List<Vector3>>();
-        private const int MAX_PATH_POINTS = 150;
+        // Переиспользуемый объект NavMeshPath — избегаем GC-аллокаций в IsPathSafe
+        private static readonly NavMeshPath _sharedNavPath = new NavMeshPath();
 
+        // ── История задач (для оверлея) ──────────────────────────────
         // Текстовая история выполненных заданий (самое свежее — первое)
         public static readonly List<string> TaskHistoryLines = new List<string>();
         private const int MAX_HISTORY = 20;
@@ -164,9 +162,6 @@ namespace ScavTaskMod
                 if (_task == ScavTaskType.SpawnRush &&
                     _spawnRushOwnerBotId == BotOwner.Id)
                     _spawnRushOwnerBotId = -1;
-
-                if (BotPaths.TryGetValue(BotOwner.Id, out var oldPath))
-                    oldPath.Clear();
 
                 _task            = PickBestTask();
                 _taskComplete    = false;
@@ -318,21 +313,6 @@ namespace ScavTaskMod
                 $"[ScavTaskMod] [{BotOwner.Id}] cooldown {cd:F0}s until {_cooldownUntil:F0}");
         }
 
-        // ── RecordPathPoint (вызывается из Logic каждую секунду) ──────
-        public static void RecordPathPoint(int botId, Vector3 pos)
-        {
-            if (!BotPaths.TryGetValue(botId, out var list))
-            {
-                list = new List<Vector3>();
-                BotPaths[botId] = list;
-            }
-            if (list.Count == 0 || Vector3.Distance(list[list.Count - 1], pos) > 2.5f)
-            {
-                list.Add(pos);
-                if (list.Count > MAX_PATH_POINTS)
-                    list.RemoveAt(0);
-            }
-        }
 
         // Вызывается из Logic чтобы пометить зону босса как обысканную
         public static void MarkBossAreaSearched(Vector3 pos)
@@ -461,6 +441,7 @@ namespace ScavTaskMod
             float   nearestDist  = float.MaxValue;
             bool    anyUnsearched = false;
 
+            // Шаг 1: находим ближайшую необысканную зону ТОЛЬКО по дистанции (дёшево, без NavMesh.CalculatePath)
             foreach (var zonePos in _bossSpawnZones)
             {
                 bool searched = false;
@@ -471,28 +452,25 @@ namespace ScavTaskMod
 
                 anyUnsearched = true;
 
-                // Snap на NavMesh перед проверкой безопасности
                 NavMeshHit hit;
                 Vector3 snapPos = NavMesh.SamplePosition(zonePos, out hit, 15f, NavMesh.AllAreas)
                     ? hit.position : zonePos;
-
-                if (!IsPathSafe(snapPos)) continue;
 
                 float d = Vector3.Distance(BotOwner.Position, snapPos);
                 if (d < nearestDist) { nearestDist = d; nearest = snapPos; }
             }
 
-            if (nearest == Vector3.zero)
+            if (!anyUnsearched)
             {
-                // Объявляем NoBossOnMap только если реально все зоны обысканы,
-                // а не просто недоступны по пути
-                if (!anyUnsearched)
-                {
-                    NoBossOnMap = true;
-                    ScavTaskPlugin.Log.LogInfo("[ScavTaskMod] Все зоны боссов обысканы — босса нет на карте");
-                }
+                NoBossOnMap = true;
+                ScavTaskPlugin.Log.LogInfo("[ScavTaskMod] Все зоны боссов обысканы — босса нет на карте");
                 return false;
             }
+
+            if (nearest == Vector3.zero) return false;
+
+            // Шаг 2: IsPathSafe только для выбранной зоны (было N вызовов — стало 1)
+            if (!IsPathSafe(nearest)) return false;
 
             pos = nearest;
             return true;
@@ -513,6 +491,27 @@ namespace ScavTaskMod
             catch { }
             ScavTaskPlugin.Log.LogInfo(
                 $"[ScavTaskMod] Зоны спавна боссов: {_bossSpawnZones.Count}");
+        }
+
+        // ── Публичный доступ к зонам боссов (используется PmcTaskLayer) ──
+        public static void EnsureBossZonesInitialized()
+        {
+            if (_bossSpawnZones == null) InitBossSpawnZones();
+        }
+
+        public static IReadOnlyList<Vector3> GetBossZones()
+        {
+            EnsureBossZonesInitialized();
+            return _bossSpawnZones;
+        }
+
+        // Проверка: помечена ли зона как обысканная (доступна для PmcTaskLayer)
+        public static bool IsZoneSearched(Vector3 pos)
+        {
+            _searchedBossAreas.RemoveAll(e => Time.time > e.expiry);
+            foreach (var s in _searchedBossAreas)
+                if (Vector3.Distance(s.pos, pos) < SearchedAreaRadius) return true;
+            return false;
         }
 
         // ── CheckPMCSpawn: бот идёт проверить место где видел PMC ──────
@@ -844,14 +843,14 @@ namespace ScavTaskMod
         private bool IsPathSafe(Vector3 dest)
         {
             // 1. NavMesh: путь должен быть полным (PathComplete)
-            var navPath = new NavMeshPath();
-            if (!NavMesh.CalculatePath(BotOwner.Position, dest, NavMesh.AllAreas, navPath))
+            // Используем переиспользуемый объект _sharedNavPath чтобы не аллоцировать GC каждый вызов
+            if (!NavMesh.CalculatePath(BotOwner.Position, dest, NavMesh.AllAreas, _sharedNavPath))
                 return false;
-            if (navPath.status != NavMeshPathStatus.PathComplete)
+            if (_sharedNavPath.status != NavMeshPathStatus.PathComplete)
                 return false;
 
             // 2. Длина пути — не идём слишком далеко
-            var corners  = navPath.corners;
+            var corners  = _sharedNavPath.corners;
             float totalLen = 0f;
             for (int i = 1; i < corners.Length; i++)
                 totalLen += Vector3.Distance(corners[i - 1], corners[i]);
@@ -929,9 +928,9 @@ namespace ScavTaskMod
             {
                 var mem = BotOwner.Memory;
                 if (mem == null) return false;
-                if (mem.GoalEnemy != null && mem.GoalEnemy.IsVisible)       return true;
+                // Враг виден или был виден недавно (расширено до 30 сек вместо 10)
                 if (mem.GoalEnemy != null &&
-                    Time.time - mem.GoalEnemy.TimeLastSeen < 10f)           return true;
+                    Time.time - mem.GoalEnemy.TimeLastSeen < 30f)           return true;
                 if (mem.IsUnderFire)                                        return true;
             }
             catch { }

@@ -144,16 +144,55 @@ namespace LifePMC
                 var mem = BotOwner.Memory;
                 if (mem == null) return false;
 
-                if (mem.GoalEnemy != null && mem.GoalEnemy.IsVisible)
+                // 1. Бот сам знает о враге (самая широкая проверка)
+                if (mem.HaveEnemy)
                 {
-                    reason = $"враг виден: {mem.GoalEnemy.Person?.Profile?.Nickname ?? "???"}";
+                    reason = "HaveEnemy";
                     return true;
                 }
-                if (mem.GoalEnemy != null && Time.time - mem.GoalEnemy.TimeLastSeen < 10f)
+
+                // 2. GoalEnemy — текущая цель
+                if (mem.GoalEnemy != null)
                 {
-                    reason = $"враг недавно видел ({(Time.time - mem.GoalEnemy.TimeLastSeen):F0}с назад)";
-                    return true;
+                    if (mem.GoalEnemy.IsVisible)
+                    {
+                        reason = $"враг виден: {mem.GoalEnemy.Person?.Profile?.Nickname ?? "???"}";
+                        return true;
+                    }
+                    if (Time.time - mem.GoalEnemy.TimeLastSeen < 12f)
+                    {
+                        reason = $"GoalEnemy недавно видел ({(Time.time - mem.GoalEnemy.TimeLastSeen):F0}с назад)";
+                        return true;
+                    }
                 }
+
+                // 3. Любой известный враг в EnemiesController (видит сейчас ИЛИ видел < 12с назад)
+                try
+                {
+                    var infos = BotOwner.EnemiesController?.EnemyInfos;
+                    if (infos != null && infos.Count > 0)
+                    {
+                        foreach (var kvp in infos)
+                        {
+                            var ei = kvp.Value;
+                            if (ei == null) continue;
+                            if (ei.IsVisible)
+                            {
+                                reason = $"видит врага [{kvp.Key?.Profile?.Nickname ?? "?"}]";
+                                return true;
+                            }
+                            if (Time.time - ei.TimeLastSeen < 12f)
+                            {
+                                reason = $"недавно видел [{kvp.Key?.Profile?.Nickname ?? "?"}] " +
+                                         $"({(Time.time - ei.TimeLastSeen):F0}с назад)";
+                                return true;
+                            }
+                        }
+                    }
+                }
+                catch { }
+
+                // 4. Под огнём
                 if (mem.IsUnderFire)
                 {
                     reason = "под огнём";

@@ -27,6 +27,21 @@ namespace LifePMC
         private static MethodInfo _forceScanMethod;
         private static bool       _lootingBotsChecked;
 
+        // ── Fika WIO sync (soft dependency, reflection only) ───────────────────
+        private static bool       _fikaChecked;
+        private static bool       _fikaReady;
+        private static Type       _fikaServerType;
+        private static Type       _fikaPlayerType;    // FikaPlayer — для чтения NetId бота
+        private static FieldInfo  _fikaNetIdField;    // FikaPlayer.NetId (int)
+        private static MethodInfo _fikaFromValue;     // WorldInteractionPacket.FromValue
+        private static MethodInfo _fikaSend;          // FikaServer.SendNetReusable<CommonPlayerPacket>
+        private static Type       _fikaCommonPktType;
+        private static FieldInfo  _fcp_NetId, _fcp_Type, _fcp_SubPacket;
+        private static object     _fikaDelivery;      // DeliveryMethod.ReliableOrdered
+        private static object     _fikaSubType;       // ECommonSubPacketType.WorldInteraction
+        private static object     _eTypeOpen;         // EInteractionType.Open
+        private static object     _eStageIgnore;      // EInteractionStage.Ignore
+
         // ── Фазы ──────────────────────────────────────────────────────────────
         private enum Phase
         {
@@ -218,6 +233,21 @@ namespace LifePMC
                     Complete(false);
                     return;
                 }
+
+                // ── Мгновенный хендофф SAIN при обнаружении угрозы ────────────
+                // HaveEnemy или IsUnderFire — немедленно отдаём управление SAIN.
+                // IsActive() уже делает это каждый тик, но Complete() здесь
+                // гарантирует что бот останавливает движение к точке прямо сейчас.
+                try
+                {
+                    var mem = BotOwner.Memory;
+                    if (mem != null && (mem.HaveEnemy || mem.IsUnderFire))
+                    {
+                        Complete(false);
+                        return;
+                    }
+                }
+                catch { }
 
                 // ── Таймаут навигации ──────────────────────────────────────────
                 float elapsed = Time.time - _startTime;
@@ -555,6 +585,7 @@ namespace LifePMC
             {
                 interactMethod.Invoke(comp, new object[] { arg });
                 Log.LogInfo($"[LifePMC] ✓ {BotOwner.name} Interact() → {goName} ({compType.Name})");
+                TryBroadcastFikaInteract(comp);
                 return true;
             }
             catch (Exception ex)
@@ -565,6 +596,140 @@ namespace LifePMC
                 if (inner.StackTrace != null)
                     Log.LogWarning($"[LifePMC]   Stack: {inner.StackTrace.Split('\n')[0].Trim()}");
                 return false;
+            }
+        }
+
+        // ── Fika: инициализация reflection-кэша ──────────────────────────────────
+        private static bool EnsureFika()
+        {
+            if (_fikaChecked) return _fikaReady;
+            _fikaChecked = true;
+            try
+            {
+                Assembly fikaAsm = null, gameAsm = null;
+                foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (a.GetName().Name == "Fika.Core")       fikaAsm = a;
+                    else if (a.GetName().Name == "Assembly-CSharp") gameAsm = a;
+                }
+                if (fikaAsm == null || gameAsm == null) return false;
+
+                _fikaServerType    = fikaAsm.GetType("Fika.Core.Networking.FikaServer");
+                _fikaCommonPktType = fikaAsm.GetType(
+                    "Fika.Core.Networking.Packets.Player.Common.CommonPlayerPacket");
+                var wioType    = fikaAsm.GetType(
+                    "Fika.Core.Networking.Packets.Player.Common.SubPackets.WorldInteractionPacket");
+                var eSubType   = fikaAsm.GetType(
+                    "Fika.Core.Networking.Packets.Player.Common.ECommonSubPacketType");
+                var delivType  = fikaAsm.GetType(
+                    "Fika.Core.Networking.LiteNetLib.DeliveryMethod");
+                var eiType     = gameAsm.GetType("EFT.EInteractionType");
+                var eisType    = gameAsm.GetType("EFT.EInteractionStage");
+
+                if (_fikaServerType == null || _fikaCommonPktType == null ||
+                    wioType == null || eSubType == null || delivType == null ||
+                    eiType == null || eisType == null)
+                    return false;
+
+                _fcp_NetId     = _fikaCommonPktType.GetField("NetId",    BindingFlags.Public | BindingFlags.Instance);
+                _fcp_Type      = _fikaCommonPktType.GetField("Type",     BindingFlags.Public | BindingFlags.Instance);
+                _fcp_SubPacket = _fikaCommonPktType.GetField("SubPacket", BindingFlags.Public | BindingFlags.Instance);
+
+                _fikaFromValue = wioType.GetMethod("FromValue", BindingFlags.Static | BindingFlags.Public);
+
+                _fikaSend = _fikaServerType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "SendNetReusable" && m.IsGenericMethod
+                                        && m.GetParameters().Length == 4)
+                    ?.MakeGenericMethod(_fikaCommonPktType);
+
+                if (_fcp_NetId == null || _fcp_Type == null || _fcp_SubPacket == null ||
+                    _fikaFromValue == null || _fikaSend == null)
+                    return false;
+
+                // FikaPlayer.NetId — читаем NetId бота (на клиенте нужен валидный NetId для TryGetValue)
+                _fikaPlayerType  = fikaAsm.GetType("Fika.Core.Main.Players.FikaPlayer");
+                _fikaNetIdField  = _fikaPlayerType?.GetField("NetId",
+                    BindingFlags.Public | BindingFlags.Instance);
+
+                // EInteractionType.Open=0, EInteractionStage.Ignore=2
+                _eTypeOpen    = Enum.ToObject(eiType,   0);
+                _eStageIgnore = Enum.ToObject(eisType,  2);
+                // DeliveryMethod.ReliableOrdered=2, ECommonSubPacketType.WorldInteraction=1
+                _fikaDelivery = Enum.ToObject(delivType, (byte)2);
+                _fikaSubType  = Enum.ToObject(eSubType,  (byte)1);
+
+                _fikaReady = true;
+                Log.LogInfo("[LifePMC] Fika.Core найден — WIO sync включён");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[LifePMC] Fika init: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// После успешного Interact() на headless-сервере отправляет
+        /// CommonPlayerPacket(WorldInteraction, Ignore) всем Fika-клиентам,
+        /// чтобы они локально вызвали wio.Interact() и включили лампы.
+        /// ВАЖНО: NetId в пакете должен быть валидным (NetId бота),
+        /// иначе клиент не найдёт игрока в Players dict и Execute() не вызовется.
+        /// </summary>
+        private void TryBroadcastFikaInteract(MonoBehaviour comp)
+        {
+            try
+            {
+                if (!EnsureFika()) return;
+
+                // Ищем FikaServer в сцене (не кэшируем — может смениться между рейдами)
+                var server = UnityEngine.Object.FindObjectOfType(_fikaServerType);
+                if (server == null) return; // Не headless-сервер
+
+                // Читаем NetId бота: BotOwner.GetPlayer является FikaPlayer (CoopBot),
+                // у которого есть публичное поле int NetId
+                int netId = 0;
+                try
+                {
+                    var botPlayer = BotOwner.GetPlayer;
+                    if (botPlayer != null && _fikaNetIdField != null &&
+                        _fikaPlayerType != null && _fikaPlayerType.IsInstanceOfType(botPlayer))
+                    {
+                        netId = (int)_fikaNetIdField.GetValue(botPlayer);
+                    }
+                }
+                catch { /* оставляем netId=0 */ }
+
+                // Получаем WIO.Id с компонента
+                var idField = comp.GetType().GetField("Id",
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                var wioId = idField != null ? (string)idField.GetValue(comp) : null;
+                if (string.IsNullOrEmpty(wioId))
+                {
+                    Log.LogWarning("[LifePMC] FikaSync: WIO.Id не найден");
+                    return;
+                }
+
+                // WorldInteractionPacket.FromValue(wioId, Open, Ignore, null)
+                var subPkt = _fikaFromValue.Invoke(null,
+                    new object[] { wioId, _eTypeOpen, _eStageIgnore, null });
+                if (subPkt == null) return;
+
+                // Строим CommonPlayerPacket { NetId=botNetId, Type=WorldInteraction, SubPacket=subPkt }
+                var pkt = Activator.CreateInstance(_fikaCommonPktType);
+                _fcp_NetId.SetValue(pkt, netId);
+                _fcp_Type.SetValue(pkt, _fikaSubType);
+                _fcp_SubPacket.SetValue(pkt, subPkt);
+
+                // FikaServer.SendNetReusable<CommonPlayerPacket>(ref pkt, ReliableOrdered, broadcast=true, null)
+                _fikaSend.Invoke(server, new object[] { pkt, _fikaDelivery, true, null });
+
+                Log.LogInfo($"[LifePMC] ✓ Fika WIO sync: Id={wioId} NetId={netId} → клиентам");
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[LifePMC] Fika sync: {ex.Message}");
             }
         }
 
@@ -877,8 +1042,9 @@ namespace LifePMC
                 _lastGoToTime   = Time.time;
                 _lastGoToTarget = target;
             }
-            if (BotOwner.Mover.IsMoving)
-                BotOwner.Steering.LookToMovingDirection();
+            // LookToMovingDirection() убран намеренно:
+            // принудительный lock взгляда вперёд мешает EFT/SAIN сканировать угрозы.
+            // GoToPoint() управляет движением — SAIN управляет головой.
         }
 
         /// <summary>Спринт на полной скорости — движение к основной точке.</summary>
